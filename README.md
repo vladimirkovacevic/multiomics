@@ -154,7 +154,7 @@ python3 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install required packages
-pip install -r docker-build/requirements.txt
+pip install -r requirements.txt
 ```
 
 Required packages:
