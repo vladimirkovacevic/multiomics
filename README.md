@@ -98,13 +98,6 @@ Docker provides a complete, reproducible environment with all dependencies pre-i
 # Pull the Docker image
 docker pull vladimirkovacevic/eqtl_intro:latest
 
-# Extract data from the original R tutorial
-mkdir -p eqtl_data/simulated
-docker run --rm humburg/eqtl-intro cat /data/simulated/sim_genotypes.tab > eqtl_data/simulated/sim_genotypes.tab
-docker run --rm humburg/eqtl-intro cat /data/simulated/sim_expression1.tab > eqtl_data/simulated/sim_expression1.tab
-docker run --rm humburg/eqtl-intro cat /data/simulated/sim_expression2.tab > eqtl_data/simulated/sim_expression2.tab
-docker run --rm humburg/eqtl-intro cat /data/simulated/sim_covariates.tab > eqtl_data/simulated/sim_covariates.tab
-
 # Run the container
 docker run -d -p 8887:8887 \
   -v $(pwd)/eqtl_data:/home/eqtl/data \
@@ -174,21 +167,6 @@ Required packages:
 - scipy==1.11.4
 - scikit-learn==1.3.2
 - statsmodels==0.14.1
-
-#### Extract Data
-
-```bash
-# Create data directory
-mkdir -p data/simulated
-
-# Extract from Docker image
-docker run --rm humburg/eqtl-intro cat /data/simulated/sim_genotypes.tab > data/simulated/sim_genotypes.tab
-docker run --rm humburg/eqtl-intro cat /data/simulated/sim_expression1.tab > data/simulated/sim_expression1.tab
-docker run --rm humburg/eqtl-intro cat /data/simulated/sim_expression2.tab > data/simulated/sim_expression2.tab
-docker run --rm humburg/eqtl-intro cat /data/simulated/sim_covariates.tab > data/simulated/sim_covariates.tab
-```
-
-Or download directly from the [original tutorial](https://jknightlab.github.io/eqtl-intro/).
 
 #### Start Jupyter
 
@@ -469,31 +447,6 @@ This work is based on the excellent [eQTL Introduction tutorial](https://jknight
 The Python conversion specifically follows the structure and exercises from:
 - [Exercises and Solutions](https://jknightlab.github.io/eqtl-intro/exercises/exercises_and_solutions.html)
 
-### Python Conversion
-- **Vladimir Kovacevic** - Python conversion, Docker packaging, additional documentation
-
-### Resources
-- **GTEx Consortium** - For advancing eQTL research
-- **Bioconductor Community** - For R/Bioconductor packages that inspired Python equivalents
-- **Python Scientific Community** - For excellent statistical libraries
-
-### Inspiration
-This tutorial was created to make eQTL analysis more accessible to Python users and to provide a modern, containerized learning environment.
-
----
-
-## 📞 Support & Contact
-
-### Getting Help
-- 📚 **Documentation**: Read the [full README](docker-build/README.md)
-- 💬 **Issues**: Open an [issue on GitHub](https://github.com/yourusername/eqtl-tutorial-python/issues)
-- 📧 **Email**: contact@example.com (for private inquiries)
-
-### Community
-- **Discussions**: Use GitHub Discussions for questions
-- **Bug Reports**: Use GitHub Issues
-- **Feature Requests**: Use GitHub Issues with `enhancement` label
-
 ### Related Resources
 - [Original R Tutorial](https://jknightlab.github.io/eqtl-intro/)
 - [Original R Exercises (basis for this tutorial)](https://jknightlab.github.io/eqtl-intro/exercises/exercises_and_solutions.html)
@@ -509,16 +462,6 @@ This tutorial was created to make eQTL analysis more accessible to Python users 
 If you find this tutorial helpful, please consider giving it a star ⭐ on GitHub!
 
 ---
-
-## 🔄 Updates & Changelog
-
-### Version 1.0.0 (2025-12-11)
-- Initial release
-- Complete Python conversion of R tutorial
-- Docker support with Jupyter Notebook
-- Comprehensive documentation
-- All 4 sections implemented
-- Professional visualizations
 
 ### Planned Features
 - [ ] Integration with real GTEx data
