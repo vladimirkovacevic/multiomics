@@ -43,8 +43,22 @@ print("used in large-scale projects like GTEx, ENCODE, and many published studie
 print("Step 1: Loading data...\n")
 
 try:
-    # Load expression data
-    expression_indexed = pd.read_csv('data/ASD_dataset/ASD_expression1.csv', index_col=0)
+    # Load expression data (raw counts)
+    expression_raw = pd.read_csv('data/ASD_dataset/ASD_expression.csv', index_col=0)
+
+    # Inverse Normal Transformation (INT) per gene — industry standard (GTEx, eQTLGen)
+    # Ranks are invariant to monotonic transforms, so log2 beforehand is redundant
+    from scipy.stats import rankdata, norm as sp_norm
+
+    def inverse_normal_transform(x):
+        """Rank-based inverse normal transformation (Blom's method)."""
+        n = len(x)
+        ranks = rankdata(x)
+        quantiles = (ranks - 3/8) / (n + 1/4)
+        return sp_norm.ppf(quantiles)
+
+    expression_indexed = expression_raw.apply(inverse_normal_transform, axis=0)
+    print(f"✓ Expression normalized via INT (mean≈0, std≈1 per gene)")
 
     # Load genotype data
     genotypes_indexed = pd.read_csv('data/ASD_dataset/ASD_genotypes.csv', index_col=0)
@@ -373,44 +387,65 @@ print("Note: On first run, Docker will pull the image from Docker Hub.")
 print("This may take a few minutes depending on your internet connection.\n")
 print("This performs regression with covariates for all SNP-gene pairs\n")
 
+# R script uses /data/ paths inside Docker; create local-path version for fallback
+r_script_local = r_script.replace('/data/', f'{data_dir}/')
+with open(os.path.join(data_dir, 'run_matrixeqtl_local.R'), 'w') as f:
+    f.write(r_script_local)
+
+docker_cmd = [
+    'docker', 'run', '--rm',
+    '-v', f'{data_dir}:/data',
+    'pl92297/matrixeqtl',
+    'Rscript', '/data/run_matrixeqtl.R'
+]
+
+succeeded = False
+
+# Try Docker first
 try:
-    # Docker command to run MatrixEQTL using the Docker Hub image
-    docker_cmd = [
-        'docker', 'run', '--rm',
-        '-v', f'{data_dir}:/data',
-        'pl92297/matrixeqtl',
-        'Rscript', '/data/run_matrixeqtl.R'
-    ]
-
-    print(f"Running MatrixEQTL...")
-    print(f"Command: {' '.join(docker_cmd)}\n")
-
-    result = subprocess.run(
-        docker_cmd,
-        capture_output=True,
-        text=True,
-        timeout=3600  # 60 minute timeout
-    )
-
+    print(f"Attempting Docker: {' '.join(docker_cmd)}\n")
+    result = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=3600)
     print(result.stdout)
-
-    if result.returncode != 0:
-        print("MatrixEQTL errors:")
+    if result.returncode == 0:
+        succeeded = True
+    else:
+        print("Docker run failed:")
         print(result.stderr)
-        raise Exception("MatrixEQTL analysis failed")
+except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+    print(f"Docker not available: {e}")
 
-    print("✓ MatrixEQTL analysis completed successfully")
+# Fallback: local Rscript
+if not succeeded:
+    print("\nFalling back to local Rscript...\n")
+    try:
+        result = subprocess.run(
+            ['Rscript', os.path.join(data_dir, 'run_matrixeqtl_local.R')],
+            capture_output=True,
+            text=True,
+            timeout=3600
+        )
+        print(result.stdout)
+        if result.returncode != 0:
+            print("Local Rscript errors:")
+            print(result.stderr)
+            raise Exception("MatrixEQTL analysis failed")
+        succeeded = True
+    except FileNotFoundError:
+        print("ERROR: Neither Docker nor local Rscript available.")
+        exit(1)
+    except subprocess.TimeoutExpired:
+        print("ERROR: MatrixEQTL analysis timed out")
+        exit(1)
+    except Exception as e:
+        print(f"ERROR: {str(e)}")
+        exit(1)
 
-except FileNotFoundError:
-    print("ERROR: Docker not found. Please ensure Docker is installed and running.")
-    print("To install Docker: https://docs.docker.com/get-docker/")
-    exit(1)
-except subprocess.TimeoutExpired:
-    print("ERROR: MatrixEQTL analysis timed out (>60 minutes)")
-    exit(1)
-except Exception as e:
-    print(f"ERROR: {str(e)}")
-    exit(1)
+# Clean up local R script
+local_r_path = os.path.join(data_dir, 'run_matrixeqtl_local.R')
+if os.path.exists(local_r_path):
+    os.remove(local_r_path)
+
+print("\n✓ MatrixEQTL analysis completed successfully")
 
 # ============================================================================
 # 5. LOAD AND ANALYZE RESULTS
