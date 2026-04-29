@@ -1,724 +1,826 @@
 """
-WGCNA Analysis using R implementation via Docker
-This module provides a Python wrapper for running WGCNA analysis
-using the R WGCNA package inside a Docker container.
+WGCNA + mQTL multi-omics pipeline.
 
-Supports multi-omics data: expression + genotypes merged together.
+Workflow
+--------
+  1. Load expression / genotypes / covariates and align samples.
+  2. Run WGCNA (R, in Docker) on the EXPRESSION matrix only.
+  3. Treat each module eigengene as a quantitative trait.
+  4. mQTL: regress every SNP against every module eigengene
+     (Bonferroni + Benjamini-Hochberg FDR).
+  5. Optional: correlate module eigengenes with clinical covariates.
+  6. Render plots and a self-contained HTML report.
+
+Genotypes are NEVER merged into the WGCNA input. Mixing 0/1/2 dosages
+with continuous expression conflates fundamentally different signal types.
+
+CLI
+---
+  python wgcna_docker.py \
+      --expression  data/ASD_dataset/ASD_expression.csv \
+      --genotypes   data/ASD_dataset/ASD_genotypes.csv \
+      --covariates  data/ASD_dataset/ASD_covariates.csv \
+      --output-dir  results/wgcna_run
 """
 
-import pandas as pd
-import numpy as np
-import subprocess
-import tempfile
+from __future__ import annotations
+
+import argparse
+import base64
+import html
+import io
+import logging
 import os
 import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
-from sklearn.preprocessing import StandardScaler
+from typing import Optional
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from scipy import stats  # noqa: E402
+
+LOG = logging.getLogger("wgcna")
+
+DEFAULT_TRAITS = ("ASD", "Age", "Sex", "IQ", "ADOS_Score")
 
 
-def preprocess_expression(expression_df):
-    """
-    Preprocess expression data for WGCNA.
-
-    Steps:
-    1. Log2(x + 1) transformation to handle count data skewness
-    2. Z-score standardization (mean=0, std=1 per gene)
-
-    Parameters:
-    -----------
-    expression_df : pd.DataFrame
-        Raw expression counts (samples x genes)
-
-    Returns:
-    --------
-    pd.DataFrame : Preprocessed expression data
-    """
-    # Log-transform to handle skewed count distribution
-    expr_log = np.log2(expression_df + 1)
-
-    # Z-score standardize
-    scaler = StandardScaler()
-    expr_scaled = pd.DataFrame(
-        scaler.fit_transform(expr_log),
-        index=expression_df.index,
-        columns=expression_df.columns
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+@dataclass
+class WGCNAConfig:
+    expression: Path
+    genotypes: Path
+    covariates: Optional[Path] = None
+    output_dir: Path = Path("wgcna_results")
+    docker_image: str = "kkhaichau/weighted_networks"
+    r_script: Optional[Path] = None
+    power: Optional[int] = None
+    min_module_size: int = 10
+    merge_cut_height: float = 0.25
+    network_type: str = "unsigned"
+    log_transform: bool = True
+    top_var_genes: Optional[int] = None
+    trait_columns: tuple = DEFAULT_TRAITS
+    fdr_threshold: float = 0.10
+    enrichment: bool = False
+    enrichment_sets: tuple = (
+        "GO_Biological_Process_2023",
+        "KEGG_2021_Human",
+        "MSigDB_Hallmark_2020",
     )
-
-    return expr_scaled
-
-
-def preprocess_genotypes(genotypes_df):
-    """
-    Preprocess genotype data for WGCNA.
-
-    Genotypes are coded as 0, 1, 2 (number of minor alleles).
-    Apply z-score standardization to put on same scale as expression.
-
-    Parameters:
-    -----------
-    genotypes_df : pd.DataFrame
-        Genotype data (samples x SNPs), values 0/1/2
-
-    Returns:
-    --------
-    pd.DataFrame : Preprocessed genotype data
-    """
-    scaler = StandardScaler()
-    geno_scaled = pd.DataFrame(
-        scaler.fit_transform(genotypes_df),
-        index=genotypes_df.index,
-        columns=genotypes_df.columns
-    )
-
-    return geno_scaled
+    enrichment_top: int = 10
+    enrichment_min_module_size: int = 5
 
 
-def merge_multiomics(expression_scaled, genotypes_scaled):
-    """
-    Merge expression and genotype data into combined feature matrix.
-
-    Adds prefixes to distinguish feature types:
-    - 'expr_' for expression features
-    - 'geno_' for genotype features
-
-    Parameters:
-    -----------
-    expression_scaled : pd.DataFrame
-        Preprocessed expression data
-    genotypes_scaled : pd.DataFrame
-        Preprocessed genotype data
-
-    Returns:
-    --------
-    pd.DataFrame : Combined feature matrix (samples x features)
-    """
-    # Add prefixes to distinguish feature types
-    expr_renamed = expression_scaled.copy()
-    expr_renamed.columns = ['expr_' + str(col) for col in expr_renamed.columns]
-
-    geno_renamed = genotypes_scaled.copy()
-    geno_renamed.columns = ['geno_' + str(col) for col in geno_renamed.columns]
-
-    # Merge horizontally
-    combined = pd.concat([expr_renamed, geno_renamed], axis=1)
-
-    return combined
-
-
-def run_wgcna_docker(
-    expression_df,
-    genotypes_df=None,
-    n_modules=4,
-    docker_image="kkhaichau/weighted_networks",
-    preprocess=True
-):
-    """
-    Run WGCNA analysis using R implementation in Docker container.
-
-    Supports both single-omics (expression only) and multi-omics
-    (expression + genotypes) analysis.
-
-    Parameters:
-    -----------
-    expression_df : pd.DataFrame
-        Expression data with samples as rows and genes as columns.
-        Index should be sample IDs, columns should be gene names.
-    genotypes_df : pd.DataFrame, optional
-        Genotype data with samples as rows and SNPs as columns.
-        Values should be 0, 1, or 2 (number of minor alleles).
-        If None, only expression data is used.
-    n_modules : int, default=4
-        Number of co-expression modules to identify.
-    docker_image : str, default="kkhaichau/weighted_networks"
-        Docker image containing R and WGCNA package.
-    preprocess : bool, default=True
-        Whether to apply preprocessing (log-transform + z-score for expression,
-        z-score for genotypes). Set to False if data is already preprocessed.
-
-    Returns:
-    --------
-    module_assignment : pd.DataFrame
-        DataFrame with columns ['Feature', 'Module', 'Type'] mapping features to modules.
-    me_df : pd.DataFrame
-        DataFrame with module eigengenes (samples x modules).
-        Columns are named 'ME0', 'ME1', etc.
-    combined_data : pd.DataFrame
-        The preprocessed combined data matrix used for WGCNA.
-    """
-    print("=" * 80)
-    print("WGCNA Multi-Omics Analysis")
-    print("=" * 80)
-
-    # Preprocess data
-    if preprocess:
-        print("\nPreprocessing data...")
-        print(f"  Expression: {expression_df.shape[0]} samples x {expression_df.shape[1]} genes")
-        expr_processed = preprocess_expression(expression_df)
-        print(f"    Applied log2(x+1) + z-score standardization")
-
-        if genotypes_df is not None:
-            print(f"  Genotypes: {genotypes_df.shape[0]} samples x {genotypes_df.shape[1]} SNPs")
-            geno_processed = preprocess_genotypes(genotypes_df)
-            print(f"    Applied z-score standardization")
-        else:
-            geno_processed = None
+# ---------------------------------------------------------------------------
+# I/O
+# ---------------------------------------------------------------------------
+def _read_indexed_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    first = df.columns[0]
+    if first.lower() in {"sample", "sampleid", "sample_id", "id"}:
+        df = df.set_index(first)
     else:
-        expr_processed = expression_df
-        geno_processed = genotypes_df
+        df = df.set_index(first)
+    return df
 
-    # Merge data if genotypes provided
-    if geno_processed is not None:
-        combined_data = merge_multiomics(expr_processed, geno_processed)
-        print(f"\nMerged multi-omics data: {combined_data.shape[0]} samples x {combined_data.shape[1]} features")
-        n_expr = len([c for c in combined_data.columns if c.startswith('expr_')])
-        n_geno = len([c for c in combined_data.columns if c.startswith('geno_')])
-        print(f"  Expression features: {n_expr}")
-        print(f"  Genotype features: {n_geno}")
-    else:
-        combined_data = expr_processed.copy()
-        combined_data.columns = ['expr_' + str(col) for col in combined_data.columns]
-        print(f"\nUsing expression data only: {combined_data.shape}")
 
-    # Create temporary directory for data exchange
-    temp_dir = tempfile.mkdtemp(prefix="wgcna_")
+def load_inputs(cfg: WGCNAConfig):
+    LOG.info("Loading inputs")
+    expr = _read_indexed_csv(cfg.expression)
+    geno = _read_indexed_csv(cfg.genotypes)
+    cov = _read_indexed_csv(cfg.covariates) if cfg.covariates and cfg.covariates.exists() else None
 
-    try:
-        # Define file paths
-        input_csv = os.path.join(temp_dir, "expression_data.csv")
-        module_csv = os.path.join(temp_dir, "module_assignment.csv")
-        eigengene_csv = os.path.join(temp_dir, "module_eigengenes.csv")
-        r_script = os.path.join(temp_dir, "wgcna_analysis.R")
+    samples = expr.index.intersection(geno.index)
+    if cov is not None:
+        samples = samples.intersection(cov.index)
 
-        # Copy R script to temp directory
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        # Try multiple possible locations
-        possible_paths = [
-            os.path.join(script_dir, "wgcna_analysis.R"),
-            os.path.join(script_dir, "..", "wgcna_analysis.R"),
-            os.path.join(script_dir, "..", "scripts", "wgcna_analysis.R"),
-        ]
-        script_source = None
-        for path in possible_paths:
-            if os.path.exists(path):
-                script_source = path
-                break
-        if script_source is None:
-            raise FileNotFoundError(f"Could not find wgcna_analysis.R script. Searched: {possible_paths}")
-        shutil.copy(script_source, r_script)
+    expr = expr.loc[samples]
+    geno = geno.loc[samples]
+    cov = cov.loc[samples] if cov is not None else None
 
-        # Save combined data to CSV
-        if combined_data.index.name is None:
-            combined_data.index.name = "SampleID"
-        combined_data.to_csv(input_csv)
+    poly = geno.var(axis=0) > 0
+    if (~poly).any():
+        LOG.info("Dropping %d monomorphic SNPs", int((~poly).sum()))
+        geno = geno.loc[:, poly]
 
-        # Build docker command
-        docker_cmd = [
+    LOG.info("Aligned: %d samples | %d genes | %d SNPs%s",
+             len(samples), expr.shape[1], geno.shape[1],
+             f" | {cov.shape[1]} covariates" if cov is not None else "")
+    return expr, geno, cov
+
+
+def preprocess_expression(expr_raw: pd.DataFrame, cfg: WGCNAConfig) -> pd.DataFrame:
+    expr = expr_raw.copy()
+    if cfg.log_transform:
+        expr = np.log2(expr + 1)
+        LOG.info("Applied log2(x + 1) to expression")
+    if cfg.top_var_genes and cfg.top_var_genes < expr.shape[1]:
+        keep = expr.var(axis=0).sort_values(ascending=False).head(cfg.top_var_genes).index
+        expr = expr[keep]
+        LOG.info("Filtered to top %d most variable genes", cfg.top_var_genes)
+    return expr
+
+
+# ---------------------------------------------------------------------------
+# WGCNA (R inside Docker)
+# ---------------------------------------------------------------------------
+def _locate_r_script() -> Optional[Path]:
+    here = Path(__file__).resolve().parent
+    for cand in (here / "wgcna_analysis.R", here.parent / "scripts" / "wgcna_analysis.R"):
+        if cand.exists():
+            return cand
+    return None
+
+
+def _parse_params(stdout: str) -> dict:
+    out = {}
+    for line in stdout.splitlines():
+        if "PARAMS" in line:
+            tail = line.split("PARAMS", 1)[1].strip()
+            for token in tail.split(","):
+                if "=" in token:
+                    k, v = token.split("=", 1)
+                    out[k.strip()] = v.strip()
+    return out
+
+
+def run_wgcna_in_docker(expr_clean: pd.DataFrame, cfg: WGCNAConfig):
+    r_script = cfg.r_script or _locate_r_script()
+    if r_script is None or not r_script.exists():
+        raise FileNotFoundError("wgcna_analysis.R not found next to wgcna_docker.py")
+
+    with tempfile.TemporaryDirectory(prefix="wgcna_") as tmp_str:
+        tmp = Path(tmp_str)
+        in_csv = tmp / "expression.csv"
+        modules_csv = tmp / "modules.csv"
+        eigen_csv = tmp / "eigengenes.csv"
+        sft_csv = tmp / "soft_threshold.csv"
+        shutil.copy(r_script, tmp / "wgcna_analysis.R")
+
+        if expr_clean.index.name is None:
+            expr_clean.index.name = "SampleID"
+        expr_clean.to_csv(in_csv)
+
+        cmd = [
             "docker", "run", "--rm",
             "--platform", "linux/amd64",
-            "-v", f"{temp_dir}:/data",
-            docker_image,
+            "-v", f"{tmp}:/data",
+            cfg.docker_image,
             "Rscript", "/data/wgcna_analysis.R",
-            "/data/expression_data.csv",
-            "/data/module_assignment.csv",
-            "/data/module_eigengenes.csv",
-            str(n_modules)
+            "/data/expression.csv",
+            "/data/modules.csv",
+            "/data/eigengenes.csv",
+            "/data/soft_threshold.csv",
+            str(cfg.power) if cfg.power is not None else "NA",
+            str(cfg.min_module_size),
+            str(cfg.merge_cut_height),
+            cfg.network_type,
         ]
+        LOG.info("Running WGCNA in Docker (%s)", cfg.docker_image)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        if result.stdout:
+            LOG.debug(result.stdout.strip())
 
-        # Run Docker container
-        print(f"\nRunning WGCNA in Docker container...")
-        result = subprocess.run(
-            docker_cmd,
-            capture_output=True,
-            text=True,
-            check=True
-        )
+        modules_df = pd.read_csv(modules_csv)
+        eigengenes_df = pd.read_csv(eigen_csv).set_index("SampleID")
+        eigengenes_df.index = expr_clean.index
+        sft_df = pd.read_csv(sft_csv)
 
-        # Print R script output
-        print(result.stdout)
-
-        if result.stderr:
-            print("R Messages:", result.stderr)
-
-        # Read results
-        module_assignment_raw = pd.read_csv(module_csv)
-        eigengenes_raw = pd.read_csv(eigengene_csv)
-
-        # Process module assignment - add feature type
-        module_assignment = module_assignment_raw.rename(columns={'Gene': 'Feature'})
-        module_assignment['Type'] = module_assignment['Feature'].apply(
-            lambda x: 'Expression' if x.startswith('expr_') else 'Genotype'
-        )
-
-        # Process eigengenes
-        me_df = eigengenes_raw.set_index('SampleID')
-        me_df.index = combined_data.index
-
-        # Validate results
-        if len(module_assignment) != len(combined_data.columns):
-            raise ValueError(
-                f"Module assignment count ({len(module_assignment)}) "
-                f"doesn't match number of features ({len(combined_data.columns)})"
-            )
-
-        if me_df.shape[0] != combined_data.shape[0]:
-            raise ValueError(
-                f"Module eigengene samples ({me_df.shape[0]}) "
-                f"doesn't match data samples ({combined_data.shape[0]})"
-            )
-
-        # Print summary
-        print("\n" + "=" * 80)
-        print("WGCNA COMPLETE")
-        print("=" * 80)
-        print(f"\nModules identified: {module_assignment['Module'].nunique()}")
-        for mod in sorted(module_assignment['Module'].unique()):
-            subset = module_assignment[module_assignment['Module'] == mod]
-            n_expr = (subset['Type'] == 'Expression').sum()
-            n_geno = (subset['Type'] == 'Genotype').sum()
-            print(f"  Module {mod}: {len(subset)} features ({n_expr} expr, {n_geno} geno)")
-
-        return module_assignment, me_df, combined_data
-
-    except subprocess.CalledProcessError as e:
-        print(f"Error running Docker container:")
-        print(f"Return code: {e.returncode}")
-        print(f"STDOUT: {e.stdout}")
-        print(f"STDERR: {e.stderr}")
-        raise
-
-    finally:
-        # Clean up temporary directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    params = _parse_params(result.stdout)
+    LOG.info("WGCNA done: %s", params)
+    return modules_df, eigengenes_df, sft_df, params
 
 
-def run_wgcna_python(combined_data, n_modules=5):
+# ---------------------------------------------------------------------------
+# Downstream: mQTL and module-trait
+# ---------------------------------------------------------------------------
+def run_mqtl(eigengenes: pd.DataFrame, genotypes: pd.DataFrame) -> pd.DataFrame:
+    samples = eigengenes.index.intersection(genotypes.index)
+    me, geno = eigengenes.loc[samples], genotypes.loc[samples]
+
+    rows = []
+    for module in me.columns:
+        y = me[module].values.astype(float)
+        for snp in geno.columns:
+            x = geno[snp].values.astype(float)
+            if np.unique(x).size < 2:
+                continue
+            slope, intercept, r, p, se = stats.linregress(x, y)
+            rows.append({"Module": module, "SNP": snp,
+                         "beta": slope, "SE": se, "r": r,
+                         "pvalue": p, "n": len(x)})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    m = len(df)
+    df["p_bonferroni"] = (df["pvalue"] * m).clip(upper=1.0)
+    df = df.sort_values("pvalue").reset_index(drop=True)
+    df["fdr_bh"] = (df["pvalue"] * m / (df.index + 1)).clip(upper=1.0)
+    df["fdr_bh"] = df["fdr_bh"][::-1].cummin()[::-1]
+    LOG.info("mQTL: %d tests | nominal p<0.05: %d | FDR<0.10: %d",
+             m, int((df["pvalue"] < 0.05).sum()), int((df["fdr_bh"] < 0.10).sum()))
+    return df
+
+
+def module_trait_corr(eigengenes: pd.DataFrame,
+                      covariates: Optional[pd.DataFrame],
+                      traits: tuple):
+    if covariates is None:
+        return pd.DataFrame(), pd.DataFrame()
+    avail = [t for t in traits if t in covariates.columns]
+    if not avail:
+        LOG.info("No matching trait columns found")
+        return pd.DataFrame(), pd.DataFrame()
+
+    r_rows, p_rows = [], []
+    for module in eigengenes.columns:
+        r_row, p_row = {}, {}
+        for trait in avail:
+            valid = ~covariates[trait].isna()
+            if valid.sum() < 3:
+                r_row[trait] = np.nan
+                p_row[trait] = np.nan
+                continue
+            r, p = stats.pearsonr(eigengenes.loc[valid, module],
+                                  covariates.loc[valid, trait])
+            r_row[trait] = r
+            p_row[trait] = p
+        r_rows.append(r_row)
+        p_rows.append(p_row)
+    return (pd.DataFrame(r_rows, index=eigengenes.columns),
+            pd.DataFrame(p_rows, index=eigengenes.columns))
+
+
+# ---------------------------------------------------------------------------
+# Module enrichment (Enrichr via gseapy)
+# ---------------------------------------------------------------------------
+def run_module_enrichment(modules_df: pd.DataFrame,
+                          background_genes: list,
+                          gene_sets: tuple,
+                          top_n: int,
+                          min_module_size: int) -> pd.DataFrame:
+    """Per-module ORA against Enrichr libraries. Background = WGCNA input genes.
+
+    Returns long-form DataFrame with one row per (Module, gene-set library, term).
+    Skips module 0 (grey) and modules smaller than `min_module_size`.
     """
-    Run WGCNA analysis using pure Python implementation.
-
-    This is a fallback when Docker is not available.
-    Uses scipy for clustering and sklearn for PCA.
-
-    Parameters:
-    -----------
-    combined_data : pd.DataFrame
-        Preprocessed feature matrix (samples x features)
-    n_modules : int, default=5
-        Number of modules to identify
-
-    Returns:
-    --------
-    module_assignment : pd.DataFrame
-        DataFrame with columns ['Feature', 'Module', 'Type']
-    me_df : pd.DataFrame
-        Module eigengenes (samples x modules)
-    """
-    from scipy.cluster.hierarchy import linkage, fcluster
-    from scipy.spatial.distance import squareform
-    from sklearn.decomposition import PCA
-    from sklearn.linear_model import LinearRegression
-
-    print("\nRunning Python-based WGCNA implementation...")
-
-    # Step 1: Compute correlation matrix
-    print("  Computing correlation matrix...")
-    S = combined_data.corr(method='pearson')
-
-    # Step 2: Select soft-thresholding power
-    print("  Selecting soft-thresholding power...")
-    powers = range(1, 21)
-    best_power = 6  # Default
-
-    for beta in powers:
-        A = np.abs(S.values) ** beta
-        k = A.sum(axis=1)
-        k_unique, k_counts = np.unique(k[k > 0], return_counts=True)
-        if len(k_unique) >= 3:
-            log_k = np.log10(k_unique).reshape(-1, 1)
-            log_pk = np.log10(k_counts)
-            model = LinearRegression().fit(log_k, log_pk)
-            r_sq = model.score(log_k, log_pk)
-            if r_sq >= 0.8 and beta >= 4:
-                best_power = beta
-                break
-
-    print(f"  Selected power: {best_power}")
-
-    # Step 3: Build adjacency matrix
-    print("  Building adjacency matrix...")
-    A = np.abs(S.values) ** best_power
-
-    # Step 4: Compute TOM
-    print("  Computing TOM...")
-    n = A.shape[0]
-    k = A.sum(axis=1)
-    L = A @ A
-
-    TOM = np.zeros((n, n))
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                TOM[i, j] = 1.0
-            else:
-                numerator = L[i, j] + A[i, j]
-                denominator = min(k[i], k[j]) + 1 - A[i, j]
-                TOM[i, j] = numerator / denominator if denominator > 0 else 0
-
-    dissTOM = 1 - TOM
-
-    # Step 5: Hierarchical clustering
-    print("  Clustering features...")
-    dissTOM_condensed = squareform(dissTOM, checks=False)
-    tree = linkage(dissTOM_condensed, method='average')
-
-    # Cut tree to get target number of modules
-    labels = fcluster(tree, t=n_modules, criterion='maxclust')
-
-    # Step 6: Create module assignment
-    module_colors = ['grey', 'turquoise', 'blue', 'brown', 'yellow', 'green',
-                     'red', 'black', 'pink', 'magenta', 'purple', 'orange']
-
-    module_assignment = pd.DataFrame({
-        'Feature': combined_data.columns.tolist(),
-        'Module': labels,
-        'ModuleColor': [module_colors[i % len(module_colors)] for i in labels],
-        'Type': ['Expression' if c.startswith('expr_') else 'Genotype'
-                 for c in combined_data.columns]
-    })
-
-    # Step 7: Compute module eigengenes
-    print("  Computing module eigengenes...")
-    ME_dict = {}
-    for mod in sorted(module_assignment['Module'].unique()):
-        features = module_assignment[module_assignment['Module'] == mod]['Feature'].tolist()
-        module_data = combined_data[features]
-
-        if len(features) == 1:
-            ME_dict[f'ME{mod}'] = module_data.iloc[:, 0].values
-        else:
-            pca = PCA(n_components=1)
-            ME_dict[f'ME{mod}'] = pca.fit_transform(module_data).flatten()
-
-    me_df = pd.DataFrame(ME_dict, index=combined_data.index)
-
-    return module_assignment, me_df
-
-
-def load_asd_dataset(data_dir="../data/ASD_dataset/"):
-    """
-    Load the ASD dataset for testing.
-
-    Parameters:
-    -----------
-    data_dir : str
-        Path to the ASD dataset directory.
-
-    Returns:
-    --------
-    expression : pd.DataFrame
-        Expression data (samples x genes)
-    genotypes : pd.DataFrame
-        Genotype data (samples x SNPs)
-    covariates : pd.DataFrame
-        Clinical covariates
-    """
-    expression = pd.read_csv(f"{data_dir}/ASD_expression.csv").set_index('sample')
-    genotypes = pd.read_csv(f"{data_dir}/ASD_genotypes.csv").set_index('sample')
-    covariates = pd.read_csv(f"{data_dir}/ASD_covariates.csv").set_index('sample')
-
-    print(f"Loaded ASD dataset:")
-    print(f"  Expression: {expression.shape}")
-    print(f"  Genotypes: {genotypes.shape}")
-    print(f"  Covariates: {covariates.shape}")
-
-    return expression, genotypes, covariates
-
-
-# For backwards compatibility
-def wgcna_analysis(expression_indexed, n_modules=4):
-    """
-    Convenience wrapper for run_wgcna_docker with the same interface
-    as the original sklearn-based implementation.
-    """
-    module_assignment, me_df, _ = run_wgcna_docker(
-        expression_indexed,
-        genotypes_df=None,
-        n_modules=n_modules
-    )
-    return module_assignment, me_df
-
-
-def run_wgcna_multiomics(
-    expression_df,
-    genotypes_df=None,
-    n_modules=5,
-    preprocess=True,
-    use_docker=True,
-    docker_image="kkhaichau/weighted_networks"
-):
-    """
-    Main entry point for multi-omics WGCNA analysis.
-
-    Tries Docker first, falls back to Python implementation if Docker unavailable.
-
-    Parameters:
-    -----------
-    expression_df : pd.DataFrame
-        Expression data (samples x genes)
-    genotypes_df : pd.DataFrame, optional
-        Genotype data (samples x SNPs), values 0/1/2
-    n_modules : int, default=5
-        Number of modules to identify
-    preprocess : bool, default=True
-        Apply preprocessing (log2+z-score for expression, z-score for genotypes)
-    use_docker : bool, default=True
-        Try Docker first; if False or Docker fails, use Python implementation
-    docker_image : str
-        Docker image for R WGCNA
-
-    Returns:
-    --------
-    module_assignment : pd.DataFrame
-        Feature to module mapping
-    me_df : pd.DataFrame
-        Module eigengenes
-    combined_data : pd.DataFrame
-        Preprocessed combined data matrix
-    """
-    print("=" * 80)
-    print("WGCNA Multi-Omics Analysis")
-    print("=" * 80)
-
-    # Preprocess data
-    if preprocess:
-        print("\nPreprocessing data...")
-        print(f"  Expression: {expression_df.shape[0]} samples x {expression_df.shape[1]} genes")
-        expr_processed = preprocess_expression(expression_df)
-        print(f"    Applied log2(x+1) + z-score standardization")
-
-        if genotypes_df is not None:
-            print(f"  Genotypes: {genotypes_df.shape[0]} samples x {genotypes_df.shape[1]} SNPs")
-            geno_processed = preprocess_genotypes(genotypes_df)
-            print(f"    Applied z-score standardization")
-        else:
-            geno_processed = None
-    else:
-        expr_processed = expression_df
-        geno_processed = genotypes_df
-
-    # Merge data
-    if geno_processed is not None:
-        combined_data = merge_multiomics(expr_processed, geno_processed)
-        print(f"\nMerged multi-omics data: {combined_data.shape[0]} samples x {combined_data.shape[1]} features")
-    else:
-        combined_data = expr_processed.copy()
-        combined_data.columns = ['expr_' + str(col) for col in combined_data.columns]
-        print(f"\nUsing expression data only: {combined_data.shape}")
-
-    # Try Docker first if requested
-    if use_docker:
-        try:
-            print("\nAttempting Docker-based R WGCNA...")
-            return run_wgcna_docker(
-                expression_df, genotypes_df, n_modules,
-                docker_image=docker_image, preprocess=preprocess
-            )
-        except Exception as e:
-            print(f"\nDocker unavailable: {e}")
-            print("Falling back to Python implementation...")
-
-    # Python fallback
-    module_assignment, me_df = run_wgcna_python(combined_data, n_modules)
-
-    # Print summary
-    print("\n" + "=" * 80)
-    print("WGCNA COMPLETE")
-    print("=" * 80)
-    print(f"\nModules identified: {module_assignment['Module'].nunique()}")
-    for mod in sorted(module_assignment['Module'].unique()):
-        subset = module_assignment[module_assignment['Module'] == mod]
-        n_expr = (subset['Type'] == 'Expression').sum()
-        n_geno = (subset['Type'] == 'Genotype').sum()
-        print(f"  Module {mod}: {len(subset)} features ({n_expr} expr, {n_geno} geno)")
-
-    return module_assignment, me_df, combined_data
-
-
-def main():
-    """Command line interface for WGCNA multi-omics analysis."""
-    import sys
-    import argparse
-
-    # Determine default paths (ASD dataset)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_data_dir = os.path.join(script_dir, "..", "data", "ASD_dataset")
-    default_expression = os.path.join(default_data_dir, "ASD_expression.csv")
-    default_genotypes = os.path.join(default_data_dir, "ASD_genotypes.csv")
-    default_covariates = os.path.join(default_data_dir, "ASD_covariates.csv")
-
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(
-        description="WGCNA Multi-Omics Analysis",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Use default ASD dataset
-  python wgcna_docker.py
-
-  # Specify custom expression file only
-  python wgcna_docker.py --expression my_expression.csv
-
-  # Specify both expression and genotypes
-  python wgcna_docker.py --expression expr.csv --genotypes geno.csv
-
-  # Specify all files with custom parameters
-  python wgcna_docker.py -e expr.csv -g geno.csv -c cov.csv -n 6 --no-docker
-        """
-    )
-
-    parser.add_argument(
-        "-e", "--expression",
-        default=default_expression,
-        help=f"Expression data CSV (samples x genes). Default: ASD_expression.csv"
-    )
-    parser.add_argument(
-        "-g", "--genotypes",
-        default=default_genotypes,
-        help=f"Genotypes data CSV (samples x SNPs, values 0/1/2). Default: ASD_genotypes.csv"
-    )
-    parser.add_argument(
-        "-c", "--covariates",
-        default=default_covariates,
-        help=f"Covariates CSV for trait correlation. Default: ASD_covariates.csv"
-    )
-    parser.add_argument(
-        "-n", "--n-modules",
-        type=int,
-        default=5,
-        help="Number of modules to identify. Default: 5"
-    )
-    parser.add_argument(
-        "--no-genotypes",
-        action="store_true",
-        help="Run with expression data only (no genotypes)"
-    )
-    parser.add_argument(
-        "--no-docker",
-        action="store_true",
-        help="Skip Docker, use Python implementation directly"
-    )
-    parser.add_argument(
-        "--no-preprocess",
-        action="store_true",
-        help="Skip preprocessing (data already log-transformed and scaled)"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        default=None,
-        help="Output prefix for results files (module_assignment.csv, eigengenes.csv)"
-    )
-
-    args = parser.parse_args()
-
-    print("WGCNA Multi-Omics Analysis")
-    print("=" * 80)
-
     try:
-        # Load expression data
-        if not os.path.exists(args.expression):
-            print(f"Error: Expression file not found: {args.expression}")
-            sys.exit(1)
+        import gseapy as gp
+    except ImportError:
+        LOG.warning("gseapy not installed; skipping --enrichment. "
+                    "Install with: pip install gseapy")
+        return pd.DataFrame()
 
-        print(f"\nLoading expression data: {args.expression}")
-        expression = pd.read_csv(args.expression)
-        # Set first column as index if it looks like sample IDs
-        if expression.columns[0].lower() in ['sample', 'sampleid', 'sample_id', 'id']:
-            expression = expression.set_index(expression.columns[0])
-        print(f"  Shape: {expression.shape}")
+    rows = []
+    sizes = modules_df["Module"].value_counts()
+    for module in sorted(modules_df["Module"].unique()):
+        if module == 0:
+            continue
+        if sizes.get(module, 0) < min_module_size:
+            LOG.info("Skipping module %d for enrichment (size %d < %d)",
+                     module, sizes.get(module, 0), min_module_size)
+            continue
+        genes = modules_df.loc[modules_df["Module"] == module, "Gene"].tolist()
+        try:
+            enr = gp.enrichr(
+                gene_list=genes,
+                gene_sets=list(gene_sets),
+                background=background_genes,
+                organism="human",
+                outdir=None,
+                no_plot=True,
+            )
+        except Exception as exc:
+            LOG.warning("Enrichr failed for module %s: %s", module, exc)
+            continue
 
-        # Load genotypes data (optional)
-        genotypes = None
-        if not args.no_genotypes:
-            if os.path.exists(args.genotypes):
-                print(f"\nLoading genotypes data: {args.genotypes}")
-                genotypes = pd.read_csv(args.genotypes)
-                if genotypes.columns[0].lower() in ['sample', 'sampleid', 'sample_id', 'id']:
-                    genotypes = genotypes.set_index(genotypes.columns[0])
-                print(f"  Shape: {genotypes.shape}")
-            else:
-                print(f"\nGenotypes file not found: {args.genotypes}")
-                print("  Running with expression data only")
+        res = enr.results
+        if res is None or res.empty:
+            continue
+        for lib, sub in res.groupby("Gene_set"):
+            top = sub.sort_values("Adjusted P-value").head(top_n)
+            for _, r in top.iterrows():
+                genes_str = r.get("Genes", "")
+                if "Overlap" in r.index:
+                    overlap = r["Overlap"]
+                else:
+                    n_hit = len(str(genes_str).split(";")) if genes_str else 0
+                    overlap = f"{n_hit}/{len(genes)}"
+                rows.append({
+                    "Module":      f"ME{int(module)}",
+                    "Library":     lib,
+                    "Term":        r["Term"],
+                    "Overlap":     overlap,
+                    "P":           r["P-value"],
+                    "FDR":         r["Adjusted P-value"],
+                    "Odds":        r.get("Odds Ratio", np.nan),
+                    "Combined":    r.get("Combined Score", np.nan),
+                    "Genes":       genes_str,
+                })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        LOG.info("Enrichment: %d (module, term) hits across %d modules",
+                 len(df), df["Module"].nunique())
+    return df
 
-        # Load covariates (optional, for trait correlation)
-        covariates = None
-        if os.path.exists(args.covariates):
-            print(f"\nLoading covariates: {args.covariates}")
-            covariates = pd.read_csv(args.covariates)
-            if covariates.columns[0].lower() in ['sample', 'sampleid', 'sample_id', 'id']:
-                covariates = covariates.set_index(covariates.columns[0])
-            print(f"  Shape: {covariates.shape}")
 
-        # Run WGCNA
-        print(f"\nRunning WGCNA analysis (n_modules={args.n_modules})...")
-        module_assignment, me_df, combined_data = run_wgcna_multiomics(
-            expression,
-            genotypes_df=genotypes,
-            n_modules=args.n_modules,
-            preprocess=not args.no_preprocess,
-            use_docker=not args.no_docker
+# ---------------------------------------------------------------------------
+# Plots (each saved to disk and base64-encoded for the HTML report)
+# ---------------------------------------------------------------------------
+def _fig_to_b64(fig) -> str:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _save_and_encode(fig, path: Path) -> str:
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    b64 = _fig_to_b64(fig)
+    return b64
+
+
+def make_plots(modules_df, eigengenes, sft_df, mqtl_df,
+               trait_r, trait_p, genotypes, params, plot_dir: Path) -> dict:
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    images = {}
+
+    chosen_beta = None
+    try:
+        chosen_beta = int(params.get("power", ""))
+    except (TypeError, ValueError):
+        chosen_beta = None
+
+    # --- 1. Soft-threshold scan ----------------------------------------------
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+    if "Power" in sft_df.columns and "SFT.R.sq" in sft_df.columns:
+        ax1.plot(sft_df["Power"], sft_df["SFT.R.sq"], "o-")
+        ax1.axhline(0.8, color="red", linestyle="--", label="R² = 0.8")
+        if chosen_beta is not None:
+            ax1.axvline(chosen_beta, color="green", linestyle="--",
+                        label=f"chosen β = {chosen_beta}")
+        ax1.set_xlabel("Soft-threshold power β")
+        ax1.set_ylabel("Scale-free fit R²")
+        ax1.set_title("Scale-free topology")
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+    if "Power" in sft_df.columns and "mean.k." in sft_df.columns:
+        ax2.plot(sft_df["Power"], sft_df["mean.k."], "o-", color="orange")
+        if chosen_beta is not None:
+            ax2.axvline(chosen_beta, color="green", linestyle="--",
+                        label=f"chosen β = {chosen_beta}")
+            ax2.legend()
+        ax2.set_xlabel("Soft-threshold power β")
+        ax2.set_ylabel("Mean connectivity")
+        ax2.set_title("Mean connectivity")
+        ax2.grid(True, alpha=0.3)
+    fig.tight_layout()
+    images["soft_threshold"] = _save_and_encode(fig, plot_dir / "soft_threshold.png")
+
+    # --- 2. Module sizes ------------------------------------------------------
+    sizes = modules_df["Module"].value_counts().sort_index()
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(sizes.index.astype(str), sizes.values, color="steelblue")
+    ax.set_xlabel("Module")
+    ax.set_ylabel("Number of genes")
+    ax.set_title("Module sizes")
+    ax.grid(True, alpha=0.3, axis="y")
+    fig.tight_layout()
+    images["module_sizes"] = _save_and_encode(fig, plot_dir / "module_sizes.png")
+
+    # --- 3. Module eigengenes heatmap ----------------------------------------
+    fig, ax = plt.subplots(figsize=(11, max(2.5, 0.4 * eigengenes.shape[1])))
+    im = ax.imshow(eigengenes.T.values, aspect="auto", cmap="RdBu_r")
+    ax.set_yticks(range(eigengenes.shape[1]))
+    ax.set_yticklabels(eigengenes.columns)
+    ax.set_xlabel("Sample")
+    ax.set_ylabel("Module eigengene")
+    ax.set_title("Module eigengenes across samples")
+    fig.colorbar(im, ax=ax, label="Eigengene value")
+    fig.tight_layout()
+    images["eigengenes_heatmap"] = _save_and_encode(fig, plot_dir / "eigengenes_heatmap.png")
+
+    # --- 4. Module-trait correlations ----------------------------------------
+    if not trait_r.empty:
+        fig, ax = plt.subplots(figsize=(max(5, 1.2 * trait_r.shape[1]),
+                                        max(2.5, 0.45 * trait_r.shape[0])))
+        im = ax.imshow(trait_r.astype(float).values, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+        ax.set_xticks(range(trait_r.shape[1]))
+        ax.set_xticklabels(trait_r.columns)
+        ax.set_yticks(range(trait_r.shape[0]))
+        ax.set_yticklabels(trait_r.index)
+        ax.set_title("Module–trait correlations")
+        for i in range(trait_r.shape[0]):
+            for j in range(trait_r.shape[1]):
+                r = trait_r.iat[i, j]
+                p = trait_p.iat[i, j]
+                if pd.notna(r):
+                    stars = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+                    ax.text(j, i, f"{r:.2f}{stars}", ha="center", va="center",
+                            fontsize=8, fontweight="bold")
+        fig.colorbar(im, ax=ax, label="Pearson r")
+        fig.tight_layout()
+        images["module_trait"] = _save_and_encode(fig, plot_dir / "module_trait.png")
+
+    # --- 5. mQTL heatmap + Manhattan -----------------------------------------
+    if not mqtl_df.empty:
+        pivot = mqtl_df.pivot(index="Module", columns="SNP", values="pvalue")
+        logp = -np.log10(pivot)
+        fig, axes = plt.subplots(1, 2, figsize=(15, 4.5))
+        im = axes[0].imshow(logp.values, cmap="viridis", aspect="auto")
+        axes[0].set_yticks(range(logp.shape[0]))
+        axes[0].set_yticklabels(logp.index)
+        axes[0].set_xticks(range(logp.shape[1]))
+        axes[0].set_xticklabels(logp.columns, rotation=90, fontsize=6)
+        axes[0].set_title("mQTL  -log10(p)")
+        fig.colorbar(im, ax=axes[0], label="-log10(p)")
+
+        plot_df = mqtl_df.copy()
+        plot_df["xpos"] = np.arange(len(plot_df))
+        palette = {m: plt.cm.tab10(i % 10) for i, m in enumerate(plot_df["Module"].unique())}
+        for module, sub in plot_df.groupby("Module"):
+            axes[1].scatter(sub["xpos"], -np.log10(sub["pvalue"]),
+                            s=14, color=palette[module], label=module, alpha=0.75)
+        bonf = -np.log10(0.05 / len(plot_df))
+        axes[1].axhline(bonf, color="red", linestyle="--", lw=0.8,
+                        label=f"Bonferroni 0.05  ({bonf:.1f})")
+        axes[1].axhline(-np.log10(0.05), color="gray", linestyle=":", lw=0.8,
+                        label="Nominal 0.05")
+        axes[1].set_xlabel("mQTL test (sorted by p)")
+        axes[1].set_ylabel("-log10(p)")
+        axes[1].set_title("mQTL Manhattan-style")
+        axes[1].legend(loc="upper right", fontsize=7, ncol=2)
+        axes[1].grid(True, alpha=0.3)
+        fig.tight_layout()
+        images["mqtl_overview"] = _save_and_encode(fig, plot_dir / "mqtl_overview.png")
+
+        # Top hit boxplot
+        top = mqtl_df.iloc[0]
+        x = genotypes.loc[eigengenes.index, top["SNP"]].values
+        y = eigengenes[top["Module"]].values
+        groups = [y[x == g] for g in (0, 1, 2) if (x == g).any()]
+        labels = [f"{g}\n(n={len(d)})" for g, d in zip((0, 1, 2), groups) if len(d) > 0]
+        fig, ax = plt.subplots(figsize=(6.5, 4.5))
+        try:
+            bp = ax.boxplot(groups, tick_labels=labels, patch_artist=True, widths=0.5)
+        except TypeError:
+            bp = ax.boxplot(groups, labels=labels, patch_artist=True, widths=0.5)
+        for patch in bp["boxes"]:
+            patch.set_facecolor("#9ecae1")
+        ax.set_xlabel(f"{top['SNP']} dosage")
+        ax.set_ylabel(f"{top['Module']} eigengene")
+        ax.set_title(f"Top mQTL: {top['Module']} ~ {top['SNP']}  "
+                     f"(β={top['beta']:.3f}, p={top['pvalue']:.2g})")
+        ax.grid(True, alpha=0.3, axis="y")
+        fig.tight_layout()
+        images["mqtl_top_hit"] = _save_and_encode(fig, plot_dir / "mqtl_top_hit.png")
+
+    return images
+
+
+# ---------------------------------------------------------------------------
+# HTML report
+# ---------------------------------------------------------------------------
+_HTML_CSS = """
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+       margin: 2em auto; max-width: 1100px; color: #222; line-height: 1.45; }
+h1 { border-bottom: 2px solid #333; padding-bottom: 0.3em; }
+h2 { margin-top: 2em; border-bottom: 1px solid #ccc; padding-bottom: 0.2em; }
+h3 { margin-top: 1.5em; color: #444; }
+table { border-collapse: collapse; margin: 1em 0; font-size: 0.92em; }
+th, td { border: 1px solid #ddd; padding: 4px 10px; text-align: right; }
+th { background: #f4f4f4; text-align: left; }
+td:first-child, th:first-child { text-align: left; }
+.meta td:first-child { font-weight: bold; width: 220px; }
+img { max-width: 100%; height: auto; border: 1px solid #eee; padding: 4px; }
+.footer { margin-top: 3em; color: #888; font-size: 0.85em; }
+.note { background: #fff8d8; border-left: 4px solid #e0c000;
+        padding: 0.6em 1em; margin: 1em 0; border-radius: 4px; }
+"""
+
+
+def _df_to_html(df: pd.DataFrame, max_rows: int = 25) -> str:
+    if df.empty:
+        return "<p><i>(none)</i></p>"
+    return df.head(max_rows).to_html(
+        index=False, float_format=lambda v: f"{v:.4g}", escape=True,
+    )
+
+
+def _meta_table(rows: list[tuple[str, str]]) -> str:
+    body = "".join(f"<tr><td>{html.escape(k)}</td><td>{html.escape(str(v))}</td></tr>" for k, v in rows)
+    return f'<table class="meta">{body}</table>'
+
+
+def render_html_report(cfg, expr, genotypes, modules_df,
+                       sft_df, mqtl_df, trait_r, trait_p, enrichment_df,
+                       params, images, output_path: Path) -> None:
+    n_modules = modules_df["Module"].nunique()
+    grey = int((modules_df["Module"] == 0).sum())
+    sizes = modules_df["Module"].value_counts().sort_index()
+    sizes_html = "<ul>" + "".join(
+        f"<li>Module <b>{m}</b>: {n} genes{' (grey/unassigned)' if m == 0 else ''}</li>"
+        for m, n in sizes.items()) + "</ul>"
+
+    sig_mqtl = mqtl_df[mqtl_df["fdr_bh"] < cfg.fdr_threshold] if not mqtl_df.empty else pd.DataFrame()
+    sig_traits = []
+    if not trait_r.empty:
+        for mod in trait_r.index:
+            for trait in trait_r.columns:
+                p = trait_p.at[mod, trait]
+                r = trait_r.at[mod, trait]
+                if pd.notna(p) and p < 0.05:
+                    sig_traits.append((mod, trait, r, p))
+    trait_rows = "".join(
+        f"<tr><td>{m}</td><td>{t}</td><td>{r:+.3f}</td><td>{p:.4g}</td></tr>"
+        for m, t, r, p in sig_traits) or "<tr><td colspan='4'><i>(none at p&lt;0.05)</i></td></tr>"
+
+    def img(key, caption):
+        if key not in images:
+            return ""
+        return (f'<figure><img alt="{caption}" '
+                f'src="data:image/png;base64,{images[key]}"/>'
+                f'<figcaption><i>{caption}</i></figcaption></figure>')
+
+    # Enrichment block: per-module collapsed sections with top terms
+    if enrichment_df is None or enrichment_df.empty:
+        enrichment_html = (
+            "<p><i>Enrichment not run "
+            "(use <code>--enrichment</code>) or no significant terms.</i></p>"
+        )
+    else:
+        cols = ["Library", "Term", "Overlap", "P", "FDR", "Genes"]
+        view = enrichment_df[["Module", *cols]].copy()
+        view["P"] = view["P"].map(lambda v: f"{v:.2g}")
+        view["FDR"] = view["FDR"].map(lambda v: f"{v:.2g}")
+        # Truncate long gene-membership strings
+        view["Genes"] = view["Genes"].str.slice(0, 80) + view["Genes"].apply(
+            lambda s: " ..." if len(s) > 80 else "")
+        sections = []
+        for mod, sub in view.groupby("Module", sort=True):
+            n_fdr = (enrichment_df.loc[enrichment_df["Module"] == mod, "FDR"] < 0.05).sum()
+            sections.append(
+                f"<details open><summary><b>{html.escape(str(mod))}</b> "
+                f"&mdash; top terms across libraries "
+                f"(FDR&lt;0.05: {int(n_fdr)})</summary>"
+                f"{sub[cols].to_html(index=False, escape=True)}"
+                f"</details>"
+            )
+        enrichment_html = (
+            f"<p>Per-module Over-Representation Analysis (Fisher exact, "
+            f"Enrichr) against background = the genes used for WGCNA. "
+            f"Showing top {cfg.enrichment_top} terms per library, sorted by FDR. "
+            f"Modules with &lt;{cfg.enrichment_min_module_size} genes "
+            f"and the grey/unassigned module are skipped.</p>"
+            + "\n".join(sections)
         )
 
-        # Save results if output prefix specified
-        if args.output:
-            module_file = f"{args.output}_modules.csv"
-            eigengene_file = f"{args.output}_eigengenes.csv"
-            module_assignment.to_csv(module_file, index=False)
-            me_df.to_csv(eigengene_file)
-            print(f"\nResults saved:")
-            print(f"  Module assignment: {module_file}")
-            print(f"  Module eigengenes: {eigengene_file}")
+    default_beta = 6 if cfg.network_type == "unsigned" else 12
 
-        # Show module-trait correlations if covariates available
-        if covariates is not None:
-            print("\n" + "=" * 80)
-            print("Module-Trait Correlations")
-            print("=" * 80)
+    if {"Power", "mean.k.", "max.k."}.issubset(sft_df.columns):
+        hub_table = pd.DataFrame({
+            "β":        sft_df["Power"].astype(int),
+            "mean k":   sft_df["mean.k."].round(3),
+            "max k":    sft_df["max.k."].round(3),
+            "max/mean": (sft_df["max.k."] / sft_df["mean.k."]).round(2),
+        })
+    else:
+        hub_table = pd.DataFrame()
 
-            from scipy import stats
+    meta = _meta_table([
+        ("Run timestamp", datetime.now().isoformat(timespec="seconds")),
+        ("Expression file", cfg.expression),
+        ("Genotypes file", cfg.genotypes),
+        ("Covariates file", cfg.covariates or "—"),
+        ("Samples (aligned)", expr.shape[0]),
+        ("Genes used for WGCNA", expr.shape[1]),
+        ("SNPs used for mQTL", genotypes.shape[1]),
+        ("Docker image", cfg.docker_image),
+        ("Soft-threshold β", params.get("power", "?")),
+        ("Network type", params.get("network", cfg.network_type)),
+        ("min module size", params.get("min_module_size", cfg.min_module_size)),
+        ("merge cut height", params.get("merge_cut_height", cfg.merge_cut_height)),
+        ("Modules (incl. grey)", n_modules),
+        ("Genes in grey/unassigned", grey),
+    ])
 
-            # Select numeric columns for correlation
-            numeric_cols = covariates.select_dtypes(include=[np.number]).columns.tolist()
-            # Prioritize common trait columns
-            priority_cols = ['ASD', 'Age', 'Sex', 'IQ', 'ADOS_Score']
-            trait_cols = [c for c in priority_cols if c in numeric_cols]
-            # Add other numeric columns (up to 10 total)
-            for c in numeric_cols:
-                if c not in trait_cols and len(trait_cols) < 10:
-                    trait_cols.append(c)
+    body = f"""
+<h1>WGCNA + mQTL Multi-Omics Report</h1>
+<div class="note">
+  WGCNA was run on the <b>expression matrix only</b>. Module eigengenes are
+  treated as quantitative traits, then tested against every SNP in the
+  genotype matrix (mQTL). This avoids merging discrete genotypes with
+  continuous expression in a single similarity network.
+</div>
 
-            if trait_cols:
-                traits = covariates[trait_cols].copy()
+<h2>1. Run summary</h2>
+{meta}
 
-                for module in me_df.columns:
-                    print(f"\n{module}:")
-                    for trait in traits.columns:
-                        valid = ~traits[trait].isna()
-                        if valid.sum() > 0:
-                            r, p = stats.pearsonr(me_df.loc[valid, module], traits.loc[valid, trait])
-                            sig = '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else ''
-                            print(f"  {trait}: r={r:.3f}, p={p:.4f} {sig}")
-            else:
-                print("No numeric columns found in covariates for correlation analysis")
+<h2>2. Soft-threshold β selection</h2>
+<p>WGCNA <code>pickSoftThreshold</code> scans β = 1..20. For each β it builds
+adjacency a<sub>ij</sub> = |cor(i,j)|<sup>β</sup>, computes node connectivity
+k, fits log P(k) ~ log k and reports the scale-free fit R². The
+<b>smallest β with R² ≥ 0.8</b> is selected (and mean connectivity should not
+be too low). If no β reaches that threshold, a default of {default_beta} is
+used ({cfg.network_type} network).</p>
+<p>Selected for this run: <b>β = {params.get("power", "?")}</b>
+&nbsp;|&nbsp; network = <b>{params.get("network", cfg.network_type)}</b></p>
+{img("soft_threshold", "Scale-free fit R² and mean connectivity vs β. Green dashed line = chosen β.")}
 
-        print("\n" + "=" * 80)
-        print("Analysis complete!")
-        print("=" * 80)
+<h3>Hub-concentration table</h3>
+<p><code>max k / mean k</code> is a rough hub-concentration index: higher β
+crushes weak correlations to 0 while strong ones survive, so a few genes
+accumulate disproportionate connectivity. Hubs emerge as this ratio grows.</p>
+{_df_to_html(hub_table, max_rows=20)}
 
-    except Exception as e:
-        print(f"\nError: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+<details><summary>Full scale-free fit table (per β)</summary>
+{_df_to_html(sft_df.round(4), max_rows=20)}
+</details>
+
+<h2>3. Modules</h2>
+<p>WGCNA identified <b>{n_modules}</b> modules (including grey =
+unassigned). Module sizes:</p>
+{sizes_html}
+{img("module_sizes", "Genes per module.")}
+{img("eigengenes_heatmap", "Module eigengenes (PC1) across samples.")}
+
+<h2>4. Module–trait correlations</h2>
+<p>Significant (p &lt; 0.05) module–trait associations:</p>
+<table><thead><tr><th>Module</th><th>Trait</th><th>r</th><th>p</th></tr></thead>
+<tbody>{trait_rows}</tbody></table>
+{img("module_trait", "Pearson correlation between module eigengenes and clinical traits.")}
+
+<h2>5. mQTL — module eigengenes as quantitative traits</h2>
+<p>Total tests: <b>{len(mqtl_df)}</b>; nominal p&lt;0.05:
+<b>{int((mqtl_df['pvalue'] < 0.05).sum()) if not mqtl_df.empty else 0}</b>;
+FDR&lt;{cfg.fdr_threshold:g}: <b>{len(sig_mqtl)}</b>;
+Bonferroni&lt;0.05: <b>{int((mqtl_df['p_bonferroni'] < 0.05).sum()) if not mqtl_df.empty else 0}</b>.</p>
+
+{img("mqtl_overview", "Left: -log10(p) heatmap (modules × SNPs). Right: Manhattan-style scatter.")}
+
+<h3>Top mQTL associations</h3>
+{_df_to_html(mqtl_df[['Module','SNP','beta','SE','pvalue','fdr_bh','p_bonferroni']],
+             max_rows=20)}
+
+{img("mqtl_top_hit", "Strongest single mQTL: eigengene distribution by genotype.")}
+
+<h2>6. Module enrichment (ORA via Enrichr)</h2>
+{enrichment_html}
+
+<h2>7. Outputs on disk</h2>
+<ul>
+  <li><code>modules.csv</code> — gene → module assignment</li>
+  <li><code>eigengenes.csv</code> — sample × module eigengene matrix</li>
+  <li><code>soft_threshold.csv</code> — pickSoftThreshold fit indices</li>
+  <li><code>mqtl_results.csv</code> — full mQTL table (sorted by p)</li>
+  <li><code>module_trait_correlations.csv</code> — module × trait r and p</li>
+  <li><code>module_enrichment.csv</code> — top GO/KEGG/Hallmark terms per module (if --enrichment)</li>
+  <li><code>plots/</code> — high-resolution PNGs</li>
+</ul>
+
+<div class="footer">
+  Generated by <code>scripts/wgcna_docker.py</code>.
+</div>
+"""
+
+    output_path.write_text(
+        f"<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>WGCNA + mQTL Report</title><style>{_HTML_CSS}</style></head>"
+        f"<body>{body}</body></html>"
+    )
+    LOG.info("Wrote HTML report: %s", output_path)
+
+
+# ---------------------------------------------------------------------------
+# CLI / orchestration
+# ---------------------------------------------------------------------------
+def _setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=level.upper(),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def _build_config(args) -> WGCNAConfig:
+    return WGCNAConfig(
+        expression=Path(args.expression),
+        genotypes=Path(args.genotypes),
+        covariates=Path(args.covariates) if args.covariates else None,
+        output_dir=Path(args.output_dir),
+        docker_image=args.docker_image,
+        power=args.power,
+        min_module_size=args.min_module_size,
+        merge_cut_height=args.merge_cut_height,
+        network_type=args.network_type,
+        log_transform=not args.no_log_transform,
+        top_var_genes=args.top_var_genes,
+        trait_columns=tuple(args.traits) if args.traits else DEFAULT_TRAITS,
+        fdr_threshold=args.fdr_threshold,
+        enrichment=args.enrichment,
+        enrichment_sets=tuple(args.enrichment_sets) if args.enrichment_sets
+                        else WGCNAConfig.enrichment_sets,
+        enrichment_top=args.enrichment_top,
+        enrichment_min_module_size=args.enrichment_min_module_size,
+    )
+
+
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="WGCNA on expression (in Docker) + mQTL on module eigengenes.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--expression", required=True, help="samples × genes CSV")
+    p.add_argument("--genotypes",  required=True, help="samples × SNPs CSV (0/1/2)")
+    p.add_argument("--covariates", default=None,  help="samples × traits CSV (optional)")
+    p.add_argument("--output-dir", default="wgcna_results", help="output directory")
+    p.add_argument("--docker-image", default="kkhaichau/weighted_networks")
+    p.add_argument("--power", type=int, default=None,
+                   help="soft-threshold β; auto-picked when omitted")
+    p.add_argument("--min-module-size", type=int, default=10)
+    p.add_argument("--merge-cut-height", type=float, default=0.25)
+    p.add_argument("--network-type", choices=("unsigned", "signed"), default="unsigned")
+    p.add_argument("--top-var-genes", type=int, default=None,
+                   help="restrict to top-N most variable genes before WGCNA")
+    p.add_argument("--no-log-transform", action="store_true",
+                   help="skip log2(x+1) (data already on log scale)")
+    p.add_argument("--traits", nargs="*", default=None,
+                   help=f"trait columns from covariates (default: {' '.join(DEFAULT_TRAITS)})")
+    p.add_argument("--fdr-threshold", type=float, default=0.10)
+    p.add_argument("--enrichment", action="store_true",
+                   help="run per-module ORA via gseapy/Enrichr (needs internet)")
+    p.add_argument("--enrichment-sets", nargs="*", default=None,
+                   help="Enrichr libraries to query "
+                        "(default: GO_Biological_Process_2023, "
+                        "KEGG_2021_Human, MSigDB_Hallmark_2020)")
+    p.add_argument("--enrichment-top", type=int, default=10,
+                   help="top N terms to keep per library per module")
+    p.add_argument("--enrichment-min-module-size", type=int, default=5,
+                   help="skip enrichment for modules smaller than this")
+    p.add_argument("--log-level", default="INFO",
+                   choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = _parse_args(argv)
+    _setup_logging(args.log_level)
+    cfg = _build_config(args)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+
+    expr_raw, geno, cov = load_inputs(cfg)
+    expr = preprocess_expression(expr_raw, cfg)
+
+    modules_df, eigengenes, sft_df, params = run_wgcna_in_docker(expr, cfg)
+    mqtl_df = run_mqtl(eigengenes, geno)
+    trait_r, trait_p = module_trait_corr(eigengenes, cov, cfg.trait_columns)
+
+    # Persist tables
+    modules_df.to_csv(cfg.output_dir / "modules.csv", index=False)
+    eigengenes.to_csv(cfg.output_dir / "eigengenes.csv")
+    sft_df.to_csv(cfg.output_dir / "soft_threshold.csv", index=False)
+    mqtl_df.to_csv(cfg.output_dir / "mqtl_results.csv", index=False)
+    if not trait_r.empty:
+        merged = trait_r.add_suffix("_r").join(trait_p.add_suffix("_p"))
+        merged.to_csv(cfg.output_dir / "module_trait_correlations.csv")
+
+    enrichment_df = pd.DataFrame()
+    if cfg.enrichment:
+        LOG.info("Running module enrichment (Enrichr) — needs internet")
+        enrichment_df = run_module_enrichment(
+            modules_df,
+            background_genes=expr.columns.tolist(),
+            gene_sets=cfg.enrichment_sets,
+            top_n=cfg.enrichment_top,
+            min_module_size=cfg.enrichment_min_module_size,
+        )
+        if not enrichment_df.empty:
+            enrichment_df.to_csv(cfg.output_dir / "module_enrichment.csv", index=False)
+
+    images = make_plots(modules_df, eigengenes, sft_df, mqtl_df,
+                        trait_r, trait_p, geno, params,
+                        plot_dir=cfg.output_dir / "plots")
+
+    render_html_report(cfg, expr, geno, modules_df,
+                       sft_df, mqtl_df, trait_r, trait_p, enrichment_df,
+                       params, images,
+                       output_path=cfg.output_dir / "report.html")
+
+    LOG.info("Done. Open %s", cfg.output_dir / "report.html")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

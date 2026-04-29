@@ -1,112 +1,98 @@
 #!/usr/bin/env Rscript
-# WGCNA Analysis Script
-# This script performs Weighted Gene Co-expression Network Analysis
-# using the R WGCNA package
+# WGCNA on an expression matrix.
+#
+# Usage:
+#   Rscript wgcna_analysis.R <expression.csv> <modules.csv> <eigengenes.csv> \
+#                            <soft_threshold.csv> <power|NA> <min_module_size> \
+#                            <merge_cut_height> <network_type>
+#
+# Inputs:
+#   expression.csv   samples x genes, first column = sample IDs
+#   power            integer or "NA" (auto-pick via pickSoftThreshold)
+#   network_type     "unsigned" or "signed"
+#
+# Outputs:
+#   modules.csv      Gene,Module
+#   eigengenes.csv   SampleID,ME0,ME1,...
+#   soft_threshold.csv  pickSoftThreshold fitIndices
 
-# Load required libraries
-suppressPackageStartupMessages({
-  library(WGCNA)
-})
-
-# Allow multi-threading
+suppressPackageStartupMessages(library(WGCNA))
+options(stringsAsFactors = FALSE)
 allowWGCNAThreads()
 
-# Parse command line arguments
 args <- commandArgs(trailingOnly = TRUE)
-if (length(args) < 3) {
-  stop("Usage: Rscript wgcna_analysis.R <input_csv> <module_output_csv> <eigengene_output_csv> [n_modules]")
+if (length(args) < 4) {
+  stop("Usage: Rscript wgcna_analysis.R <input.csv> <modules.csv> <eigengenes.csv> <sft.csv> [power] [min_module_size] [merge_cut_height] [network_type]")
 }
 
-input_file <- args[1]
-module_output_file <- args[2]
-eigengene_output_file <- args[3]
-n_modules <- if (length(args) >= 4) as.integer(args[4]) else 4
+input_file       <- args[1]
+modules_file     <- args[2]
+eigengenes_file  <- args[3]
+sft_file         <- args[4]
+power_arg        <- if (length(args) >= 5) args[5] else "NA"
+min_module_size  <- if (length(args) >= 6) as.integer(args[6]) else 10L
+merge_cut_height <- if (length(args) >= 7) as.numeric(args[7]) else 0.25
+network_type     <- if (length(args) >= 8) args[8] else "unsigned"
 
-cat("Performing WGCNA-like Co-expression Network Analysis\n\n")
-cat(paste(rep("=", 80), collapse=""), "\n")
+cat(sprintf("[wgcna_analysis.R] reading %s\n", input_file))
+datExpr <- read.csv(input_file, row.names = 1, check.names = FALSE)
+cat(sprintf("[wgcna_analysis.R] %d samples x %d genes\n",
+            nrow(datExpr), ncol(datExpr)))
 
-# Read expression data
-# Expected format: rows are samples, columns are genes
-expr_data <- read.csv(input_file, row.names = 1, check.names = FALSE)
-
-cat(sprintf("Loaded expression data: %d samples x %d genes\n", nrow(expr_data), ncol(expr_data)))
-
-# Check for missing values
-if (any(is.na(expr_data))) {
-  cat("Warning: Found missing values, removing them\n")
-  expr_data <- na.omit(expr_data)
+gsg <- goodSamplesGenes(datExpr, verbose = 0)
+if (!gsg$allOK) {
+  cat(sprintf("[wgcna_analysis.R] dropping %d genes / %d samples failing QC\n",
+              sum(!gsg$goodGenes), sum(!gsg$goodSamples)))
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
 }
 
-# Check for genes with zero variance
-good_genes <- apply(expr_data, 2, var) > 0
-if (sum(!good_genes) > 0) {
-  cat(sprintf("Removing %d genes with zero variance\n", sum(!good_genes)))
-  expr_data <- expr_data[, good_genes]
+powers <- c(1:20)
+sft <- pickSoftThreshold(datExpr, powerVector = powers,
+                         networkType = network_type, verbose = 0)
+write.csv(sft$fitIndices, sft_file, row.names = FALSE, quote = FALSE)
+
+if (toupper(power_arg) == "NA") {
+  power <- sft$powerEstimate
+  if (is.na(power)) {
+    power <- if (network_type == "signed") 12L else 6L
+    cat(sprintf("[wgcna_analysis.R] pickSoftThreshold returned NA, default beta=%d\n", power))
+  } else {
+    cat(sprintf("[wgcna_analysis.R] auto-selected beta=%d\n", power))
+  }
+} else {
+  power <- as.integer(power_arg)
+  cat(sprintf("[wgcna_analysis.R] using user-supplied beta=%d\n", power))
 }
 
-# Calculate correlation matrix (genes x genes)
-expr_corr <- cor(expr_data, method = "pearson", use = "pairwise.complete.obs")
-
-# Convert correlation to distance
-expr_dist <- 1 - abs(expr_corr)
-
-cat(sprintf("Gene correlation matrix shape: (%d, %d)\n", nrow(expr_corr), ncol(expr_corr)))
-cat(sprintf("Gene distance matrix shape: (%d, %d)\n", nrow(expr_dist), ncol(expr_dist)))
-
-# Perform hierarchical clustering on genes
-gene_tree <- hclust(as.dist(expr_dist), method = "average")
-
-# Cut tree to get modules
-module_labels <- cutree(gene_tree, k = n_modules)
-
-# Adjust module labels to be 0-indexed (to match Python implementation)
-module_labels <- module_labels - 1
-
-# Create module assignment data frame
-module_assignment <- data.frame(
-  Gene = colnames(expr_data),
-  Module = module_labels,
-  stringsAsFactors = FALSE
+tom_type <- if (network_type == "signed") "signed" else "unsigned"
+net <- blockwiseModules(
+  datExpr,
+  power            = power,
+  networkType      = network_type,
+  TOMType          = tom_type,
+  minModuleSize    = min_module_size,
+  mergeCutHeight   = merge_cut_height,
+  numericLabels    = TRUE,
+  pamRespectsDendro = FALSE,
+  saveTOMs         = FALSE,
+  verbose          = 0
 )
 
-cat(sprintf("\nIdentified %d co-expression modules\n", n_modules))
-cat("Module sizes:\n")
-module_counts <- table(module_assignment$Module)
-for (i in sort(unique(module_assignment$Module))) {
-  cat(sprintf("%d    %d\n", i, module_counts[as.character(i)]))
-}
+modules <- net$colors
+MEs     <- net$MEs
 
-# Print genes in each module
-for (mod in sort(unique(module_labels))) {
-  genes_in_module <- module_assignment$Gene[module_assignment$Module == mod]
-  cat(sprintf("Module %d: %s\n", mod, paste(genes_in_module, collapse=", ")))
-}
+gene_names <- if (!is.null(names(modules))) names(modules) else colnames(datExpr)
+module_df <- data.frame(
+  Gene   = gene_names,
+  Module = as.integer(modules)
+)
+write.csv(module_df, modules_file, row.names = FALSE, quote = FALSE)
 
-# Calculate module eigengenes
-# WGCNA moduleEigengenes function expects samples as rows, genes as columns
-module_colors <- paste0("ME", module_labels)
-names(module_colors) <- colnames(expr_data)
+eigengenes_out <- data.frame(SampleID = rownames(datExpr), MEs, check.names = FALSE)
+write.csv(eigengenes_out, eigengenes_file, row.names = FALSE, quote = FALSE)
 
-# Calculate eigengenes using WGCNA's moduleEigengenes function
-MEs <- moduleEigengenes(expr_data, colors = module_colors)$eigengenes
-
-# Rename columns to match expected format (ME0, ME1, etc.)
-colnames(MEs) <- gsub("MEME", "ME", colnames(MEs))
-
-# Reorder columns by module number
-module_nums <- as.integer(gsub("ME", "", colnames(MEs)))
-MEs <- MEs[, order(module_nums)]
-
-cat("\n✓ Module eigengenes calculated\n")
-cat(sprintf("  Shape: (%d, %d)\n", nrow(MEs), ncol(MEs)))
-
-# Write results to CSV files
-write.csv(module_assignment, module_output_file, row.names = FALSE, quote = FALSE)
-cat(sprintf("\n✓ Module assignments saved to: %s\n", module_output_file))
-
-# Add sample IDs as first column for eigengenes
-eigengenes_output <- cbind(SampleID = rownames(expr_data), MEs)
-write.csv(eigengenes_output, eigengene_output_file, row.names = FALSE, quote = FALSE)
-cat(sprintf("✓ Module eigengenes saved to: %s\n", eigengene_output_file))
-
-cat("\nWGCNA analysis complete!\n")
+n_mod <- length(unique(modules))
+cat(sprintf("[wgcna_analysis.R] PARAMS power=%d,modules=%d,network=%s,min_module_size=%d,merge_cut_height=%.3f\n",
+            power, n_mod, network_type, min_module_size, merge_cut_height))
+cat(sprintf("[wgcna_analysis.R] wrote %s, %s, %s\n",
+            modules_file, eigengenes_file, sft_file))
