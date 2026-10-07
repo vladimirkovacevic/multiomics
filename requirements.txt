@@ -8,3 +8,18 @@ seaborn==0.13.0
 scipy==1.11.4
 scikit-learn==1.3.2
 statsmodels==0.14.1
+
+# ML lessons 5-8 (notebooks 5_ML_intro ... 8_ML_Multiomics_integration_and_patient_stratification)
+xgboost
+shap
+lime
+lazypredict>=0.3
+lightgbm
+snfpy
+# TabFM (Google's tabular foundation model) requires Python >= 3.11
+tabfm[jax] @ git+https://github.com/google-research/tabfm.git
+# LimiX-2 (Stable AI + Tsinghua structured-data foundation model) requires Python >= 3.12.
+# Installed from a local clone (claude_intermediate/LimiX) with small macOS compatibility
+# patches (optional triton kernels guarded, cache dir moved to ~/.cache/limix) - see
+# notebooks/5_ML_intro.ipynb section 3.8. Upstream: git+https://github.com/limix-ldm-ai/LimiX
+torch>=2.9.1
